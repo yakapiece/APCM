@@ -1,3 +1,4 @@
+// Test
 WITH latest_values AS (
   SELECT
     patientid,
