@@ -1,0 +1,197 @@
+WITH latest_values AS (
+  SELECT
+    patientid,
+    customfieldname,
+    customfieldvalue,
+    createddatetime,
+    ROW_NUMBER() OVER (
+      PARTITION BY patientid, customfieldname
+      ORDER BY createddatetime DESC
+    ) AS rn
+  FROM
+    customdemographics
+  WHERE
+    (
+      customfieldname ILIKE '%APCM Enrollment%'
+      OR customfieldname ILIKE '%APCM enrollment status date%'
+    )
+    AND deleteddatetime IS NULL
+),
+apcm_status AS (
+  SELECT
+    patientid,
+    MAX(
+      CASE
+        WHEN customfieldname ILIKE '%APCM Enrollment%' THEN customfieldvalue
+      END
+    ) AS latest_enrollment_status,
+    MAX(
+      CASE
+        WHEN customfieldname ILIKE '%APCM enrollment status date%' THEN customfieldvalue
+      END
+    ) AS latest_status_date
+  FROM
+    latest_values
+  WHERE
+    rn = 1
+  GROUP BY
+    patientid
+),
+latest_claim AS (
+  SELECT
+    cl.patientid,
+    cl.claimid,
+    ROW_NUMBER() OVER (
+      PARTITION BY cl.patientid
+      ORDER BY cl.claimservicedate DESC
+    ) AS claim_rank
+  FROM
+    claim AS cl
+),
+latest_careplan AS (
+  SELECT
+    c.chartid,
+    cplan.cmcareplanid,
+    cplan.createddatetime,
+    cplan.createdby,
+    ROW_NUMBER() OVER (
+      PARTITION BY c.chartid
+      ORDER BY cplan.createddatetime DESC
+    ) AS rn
+  FROM
+    cmcareplan AS cplan
+    JOIN chart AS c ON cplan.chartid = c.chartid
+  WHERE
+    cplan.deleteddatetime IS NULL
+),
+problem_count AS (
+  SELECT
+    a.patientid,
+    COUNT(DISTINCT cp.description) AS num_problems
+  FROM
+    apcm_status AS a
+    JOIN patient AS p ON a.patientid = p.patientid
+    JOIN chart AS c ON p.enterpriseid = c.enterpriseid
+    LEFT JOIN latest_careplan AS lcplan ON c.chartid = lcplan.chartid
+    AND lcplan.rn = 1
+    LEFT JOIN cmplanproblem AS cp ON lcplan.cmcareplanid = cp.cmcareplanid
+    AND cp.deleteddatetime IS NULL
+  GROUP BY
+    a.patientid
+),
+snomed_to_icd AS (
+  SELECT
+    cp.snomedcode,
+    LISTAGG(DISTINCT i.diagnosiscode, '; ') WITHIN GROUP (
+      ORDER BY i.diagnosiscode
+    ) AS mapped_icd10_codes
+  FROM
+    cmplanproblem AS cp
+    JOIN snomedicd10map AS sim ON cp.snomedcode = sim.snomedcode
+    JOIN icdcodeall AS i ON sim.icdcodeallid = i.icdcodeid
+  WHERE
+    cp.deleteddatetime IS NULL
+    AND sim.deleteddatetime IS NULL
+    AND i.diagnosiscodeset = 'ICD10'
+    AND sim.priority = (
+      SELECT
+        MIN(priority)
+      FROM
+        snomedicd10map sim2
+      WHERE
+        sim2.snomedcode = cp.snomedcode
+        AND sim2.deleteddatetime IS NULL
+    )
+  GROUP BY
+    cp.snomedcode
+)
+SELECT
+  a.patientid,
+  a.latest_enrollment_status,
+  a.latest_status_date,
+  lcplan.cmcareplanid,
+  lcplan.createddatetime AS careplan_created_date,
+  lcplan.createdby AS careplan_created_by,
+  d.departmentname AS current_department,
+  prov.schedulingname AS assigned_provider,
+  ins.name AS insurance_name,
+  COALESCE(
+    LISTAGG(DISTINCT cp.description, '; ') WITHIN GROUP (
+      ORDER BY cp.description
+    ),
+    'No problems'
+  ) AS problem_list,
+  COALESCE(
+    LISTAGG(DISTINCT cp.snomedcode, '; ') WITHIN GROUP (
+      ORDER BY cp.snomedcode
+    ),
+    'No SNOMED codes'
+  ) AS snomed_codes,
+  COALESCE(
+    LISTAGG(DISTINCT sti.mapped_icd10_codes, '; ') WITHIN GROUP (
+      ORDER BY sti.mapped_icd10_codes
+    ),
+    'No mapped ICD10 codes'
+  ) AS mapped_icd10_from_snomed,
+  COALESCE(
+    LISTAGG(DISTINCT cd.diagnosiscode, '; ') WITHIN GROUP (
+      ORDER BY cd.diagnosiscode
+    ),
+    'No diagnoses'
+  ) AS recent_icd10_codes,
+  CASE
+    WHEN ins.name ILIKE '%DUAL ELIGIBLE%' AND pc.num_problems >= 2 THEN 'G0558'
+    WHEN pc.num_problems >= 2 THEN 'G0557'
+    WHEN pc.num_problems = 1 THEN 'G0556'
+    ELSE NULL
+  END AS cpt_code_to_bill
+FROM
+  apcm_status AS a
+  JOIN patient AS p ON a.patientid = p.patientid
+  JOIN chart AS c ON p.enterpriseid = c.enterpriseid
+  LEFT JOIN patientinsurance AS pi ON p.patientid = pi.patientid 
+    AND pi.sequencenumber = '1' 
+    AND cancellationdate IS NULL
+    AND pi.deleteddatetime IS NULL
+  LEFT JOIN insurancepackage AS ins ON pi.insurancepackageid = ins.insurancepackageid
+  LEFT JOIN latest_careplan AS lcplan ON c.chartid = lcplan.chartid
+    AND lcplan.rn = 1
+  LEFT JOIN cmplanproblem AS cp ON lcplan.cmcareplanid = cp.cmcareplanid
+    AND cp.deleteddatetime IS NULL
+  LEFT JOIN snomed_to_icd AS sti ON cp.snomedcode = sti.snomedcode
+  LEFT JOIN department AS d ON p.currentdepartmentid = d.departmentid
+  LEFT JOIN provider AS prov ON p.primaryproviderid = prov.providerid
+  LEFT JOIN latest_claim AS lc ON a.patientid = lc.patientid
+    AND lc.claim_rank = 1
+  LEFT JOIN claimdiagnosis AS cd ON lc.claimid = cd.claimid
+    AND cd.deleteddatetime IS NULL
+  LEFT JOIN problem_count AS pc ON a.patientid = pc.patientid
+WHERE
+  EXISTS (
+    SELECT 1
+    FROM appointmentview av
+    WHERE av.patientid = a.patientid
+      AND av.appointmentdate >= '2025-04-01'
+  )
+//  AND (
+//    ins.name ILIKE 'Medicare B-%'
+//    OR (
+//      UPPER(ins.name) LIKE '%UNITED%'
+//      AND UPPER(ins.name) LIKE '%MEDICARE%'
+//    )
+//    OR (
+//      UPPER(ins.name) LIKE '%NEIGHBORHOOD%'
+//      AND UPPER(ins.name) LIKE '%MEDICARE%'
+//    )
+//  )
+GROUP BY
+  a.patientid,
+  a.latest_enrollment_status,
+  a.latest_status_date,
+  lcplan.cmcareplanid,
+  lcplan.createddatetime,
+  lcplan.createdby,
+  d.departmentname,
+  prov.schedulingname,
+  ins.name,
+  pc.num_problems;
