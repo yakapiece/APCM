@@ -1,4 +1,15 @@
-// Test3
+/*
+APCM Tools Repository
+=====================
+
+This SQL file is part of the Advanced Primary Care Management (APCM) tools repository on GitHub: https://github.com/yakapiece/APCM
+
+These queries were originally created in Snowflake for Athena's DataView product and are being adapted/migrated for use in other environments.
+
+Collaborators:
+- David Gellis, MD, CEO: https://www.linkedin.com/in/david-gellis-1b81345a
+- Robert Rodgers, VP of Revenue Cycle Management: https://www.linkedin.com/in/robertjrodgers/
+*/
 WITH latest_values AS (
   SELECT
     patientid,
@@ -55,6 +66,8 @@ latest_careplan AS (
     cplan.cmcareplanid,
     cplan.createddatetime,
     cplan.createdby,
+    cplan.lastmodifieddatetime,
+    cplan.lastmodifiedby,
     ROW_NUMBER() OVER (
       PARTITION BY c.chartid
       ORDER BY cplan.createddatetime DESC
@@ -113,6 +126,8 @@ SELECT
   lcplan.cmcareplanid,
   lcplan.createddatetime AS careplan_created_date,
   lcplan.createdby AS careplan_created_by,
+  lcplan.lastmodifiedby AS careplan_modified_by,
+  lcplan.lastmodifieddatetime AS careplan_modified_date,
   d.departmentname AS current_department,
   prov.schedulingname AS assigned_provider,
   ins.name AS insurance_name,
@@ -192,6 +207,8 @@ GROUP BY
   lcplan.cmcareplanid,
   lcplan.createddatetime,
   lcplan.createdby,
+  lcplan.lastmodifieddatetime,
+  lcplan.lastmodifiedby,
   d.departmentname,
   prov.schedulingname,
   ins.name,
